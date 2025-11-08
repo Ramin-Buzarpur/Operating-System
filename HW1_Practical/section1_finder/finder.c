@@ -7,132 +7,155 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <limits.h>
-#include <errno.h>
 
-typedef struct DirNode {
+#define MAX_QUEUE    4096
+#define MAX_THREADS  8
+
+typedef struct {
     char path[PATH_MAX];
-    struct DirNode *next;
-} DirNode;
+} queue_item_t;
 
-static DirNode *q_head = NULL, *q_tail = NULL;
-static pthread_mutex_t q_mtx = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t q_cv = PTHREAD_COND_INITIALIZER;
-static int active_workers = 0;
-static int stop_all = 0;
+static queue_item_t queue_buf[MAX_QUEUE];
+static int queue_head = 0;
+static int queue_tail = 0;
 
-static char target_name[NAME_MAX+1];
+static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  queue_cv    = PTHREAD_COND_INITIALIZER;
 
-static void enqueue(const char *path) {
-    DirNode *n = (DirNode*)malloc(sizeof(DirNode));
-    if(!n) { perror("malloc"); exit(1);}
-    strncpy(n->path, path, sizeof(n->path));
-    n->path[sizeof(n->path)-1] = '\0';
-    n->next = NULL;
-    if(!q_tail) { q_head = q_tail = n; } else { q_tail->next = n; q_tail = n; }
+static int should_stop = 0;
+static int active_dirs = 0;
+static char target_name[NAME_MAX + 1];
+
+static int queue_is_empty(void) {
+    return (queue_head == queue_tail);
 }
 
-static int dequeue(char *out) {
-    if(!q_head) return 0;
-    DirNode *n = q_head; q_head = n->next; if(!q_head) q_tail = NULL;
-    strncpy(out, n->path, PATH_MAX);
-    free(n);
+static int queue_is_full(void) {
+    int next = (queue_tail + 1) % MAX_QUEUE;
+    return (next == queue_head);
+}
+
+static int queue_push(const char *path) {
+    if (queue_is_full()) {
+        return 0;
+    }
+    strncpy(queue_buf[queue_tail].path, path, PATH_MAX);
+    queue_buf[queue_tail].path[PATH_MAX - 1] = '\0';
+    queue_tail = (queue_tail + 1) % MAX_QUEUE;
     return 1;
 }
 
-static void *worker(void *arg){
+static int queue_pop(char *out_path) {
+    if (queue_is_empty()) {
+        return 0;
+    }
+    strncpy(out_path, queue_buf[queue_head].path, PATH_MAX);
+    queue_head = (queue_head + 1) % MAX_QUEUE;
+    return 1;
+}
+
+static void *worker_thread(void *arg) {
     (void)arg;
-    char dirpath[PATH_MAX];
-    while(1){
-        pthread_mutex_lock(&q_mtx);
-        while(!stop_all && !q_head){
-            pthread_cond_wait(&q_cv, &q_mtx);
+    char dir_path[PATH_MAX];
+    while (1) {
+        pthread_mutex_lock(&queue_mutex);
+        while (!should_stop && queue_is_empty()) {
+            pthread_cond_wait(&queue_cv, &queue_mutex);
         }
-        if(stop_all){
-            pthread_mutex_unlock(&q_mtx);
+        if (should_stop) {
+            pthread_mutex_unlock(&queue_mutex);
             break;
         }
-        if(!dequeue(dirpath)){
-            pthread_mutex_unlock(&q_mtx);
+        if (!queue_pop(dir_path)) {
+            pthread_mutex_unlock(&queue_mutex);
             continue;
         }
-        active_workers++;
-        pthread_mutex_unlock(&q_mtx);
-
-        DIR *d = opendir(dirpath);
-        if(!d){
-            goto done_dir;
-        }
-        struct dirent *ent;
-        while((ent = readdir(d)) != NULL){
-            if(strcmp(ent->d_name, ".")==0 || strcmp(ent->d_name, "..")==0) continue;
-            char child[PATH_MAX];
-            int n = snprintf(child, sizeof(child), "%s/%s", dirpath, ent->d_name);
-            if(n < 0 || n >= (int)sizeof(child)) continue; // avoid truncation
-            struct stat st;
-            if(lstat(child, &st) == -1) continue;
-            if(S_ISDIR(st.st_mode)){
-                pthread_mutex_lock(&q_mtx);
-                enqueue(child);
-                pthread_cond_signal(&q_cv);
-                pthread_mutex_unlock(&q_mtx);
-            } else if(S_ISREG(st.st_mode)) {
-                if(strcmp(ent->d_name, target_name) == 0){
-                    char real[PATH_MAX];
-                    if(realpath(child, real) == NULL){
-                        strncpy(real, child, sizeof(real)); real[sizeof(real)-1]='\0';
+        active_dirs += 1;
+        pthread_mutex_unlock(&queue_mutex);
+        DIR *d = opendir(dir_path);
+        if (d != NULL) {
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL) {
+                if (strcmp(ent->d_name, ".") == 0 ||
+                    strcmp(ent->d_name, "..") == 0) {
+                    continue;
+                }
+                char child[PATH_MAX];
+                int n = snprintf(child, sizeof(child), "%s/%s",
+                                 dir_path, ent->d_name);
+                if (n < 0 || n >= (int)sizeof(child)) {
+                    continue;
+                }
+                struct stat st;
+                if (lstat(child, &st) == -1) {
+                    continue;
+                }
+                if (S_ISDIR(st.st_mode)) {
+                    pthread_mutex_lock(&queue_mutex);
+                    if (queue_push(child)) {
+                        pthread_cond_signal(&queue_cv);
                     }
-                    printf("Found by thread %lu: %s\n", (unsigned long)pthread_self(), real);
-                    fflush(stdout);
+                    pthread_mutex_unlock(&queue_mutex);
+                }
+                else if (S_ISREG(st.st_mode)) {
+                    if (strcmp(ent->d_name, target_name) == 0) {
+                        char abs_path[PATH_MAX];
+                        if (realpath(child, abs_path) == NULL) {
+                            strncpy(abs_path, child, sizeof(abs_path));
+                            abs_path[sizeof(abs_path) - 1] = '\0';
+                        }
+                        printf("Found by thread %lu: %s\n",
+                               (unsigned long)pthread_self(),
+                               abs_path);
+                        fflush(stdout);
+                    }
                 }
             }
+            closedir(d);
         }
-        closedir(d);
-    done_dir:
-        pthread_mutex_lock(&q_mtx);
-        active_workers--;
-        if(!q_head && active_workers==0){
-            stop_all = 1;
-            pthread_cond_broadcast(&q_cv);
+
+        pthread_mutex_lock(&queue_mutex);
+        active_dirs -= 1;
+        if (queue_is_empty() && active_dirs == 0) {
+            should_stop = 1;
+            pthread_cond_broadcast(&queue_cv);
         }
-        pthread_mutex_unlock(&q_mtx);
+        pthread_mutex_unlock(&queue_mutex);
     }
+
     return NULL;
 }
 
-int main(int argc, char **argv){
-    if(argc != 3){
-        fprintf(stderr, "Usage: %s <start_directory> <target_filename>\n", argv[0]);
+int main(int argc, char **argv) {
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <start_dir> <target_filename>\n", argv[0]);
         return 1;
     }
-    char start[PATH_MAX];
-    if(realpath(argv[1], start) == NULL){
+    char start_dir[PATH_MAX];
+    if (realpath(argv[1], start_dir) == NULL) {
         perror("realpath");
         return 1;
     }
     strncpy(target_name, argv[2], sizeof(target_name));
-    target_name[sizeof(target_name)-1] = '\0';
-
-    pthread_mutex_lock(&q_mtx);
-    enqueue(start);
-    pthread_mutex_unlock(&q_mtx);
-
-    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-    int nthreads = (ncpu>0 && ncpu<64) ? (int)ncpu*2 : 8;
-
-    pthread_t *ths = calloc(nthreads, sizeof(pthread_t));
-    if(!ths){ perror("calloc"); return 1; }
-
-    for(int i=0;i<nthreads;i++){
-        if(pthread_create(&ths[i], NULL, worker, NULL)!=0){
-            perror("pthread_create"); return 1;
+    target_name[sizeof(target_name) - 1] = '\0';
+    pthread_mutex_lock(&queue_mutex);
+    (void)queue_push(start_dir);
+    pthread_mutex_unlock(&queue_mutex);
+    pthread_t threads[MAX_THREADS];
+    int i;
+    for (i = 0; i < MAX_THREADS; i += 1) {
+        if (pthread_create(&threads[i], NULL, worker_thread, NULL) != 0) {
+            perror("pthread_create");
+            return 1;
         }
     }
-    pthread_mutex_lock(&q_mtx);
-    pthread_cond_broadcast(&q_cv);
-    pthread_mutex_unlock(&q_mtx);
 
-    for(int i=0;i<nthreads;i++) pthread_join(ths[i], NULL);
-
+    pthread_mutex_lock(&queue_mutex);
+    pthread_cond_broadcast(&queue_cv);
+    pthread_mutex_unlock(&queue_mutex);
+    for (i = 0; i < MAX_THREADS; i += 1) {
+        (void)pthread_join(threads[i], NULL);
+    }
     printf("Search complete.\n");
     return 0;
 }

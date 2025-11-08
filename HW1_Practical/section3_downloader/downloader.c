@@ -1,7 +1,3 @@
-// downloader.c — robust HTTP/local multi-part downloader (pthread + curl)
-// Build: gcc -Wall -O2 -pthread -o downloader downloader.c
-// Usage: ./downloader <url_or_path> <num_threads>
-
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,220 +6,262 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <errno.h>
-#include <stdarg.h>   // <- for va_list / va_start / va_end
-
-#define CURL_TIMEOUT_OPTS "--connect-timeout 5 --max-time 20"
-
-static int DEBUG_LOG = 0;
 
 typedef struct {
     long long start;
     long long end;
-    int idx;
-    char url[1024];
-    char outname[256];
-    int is_http;
-} Task;
+    int       index;
+    int       is_http;
+    char      source[1024];
+    char      part_name[64];
+} task_t;
 
-static void dbg(const char *fmt, ...) {
-    if(!DEBUG_LOG) return;
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    va_end(ap);
+static int DEBUG_LOG = 0;
+static long long get_local_size(const char *path) {
+    struct stat st;
+    int ok = stat(path, &st);
+    if (ok == 0) {
+        return st.st_size;
+    }
+    return -1;
 }
-
-static void *worker(void *arg){
-    Task *t=(Task*)arg;
-
-    if(t->is_http){
-        char cmd[2048];
-        // -sS: silent but show errors, --fail: fail non-2xx, -L: follow redirects
-        snprintf(cmd,sizeof(cmd),
-            "curl -sS --fail -L " CURL_TIMEOUT_OPTS " --range %lld-%lld -o \"%s\" \"%s\"",
-            t->start, t->end, t->outname, t->url);
-
-        fprintf(stdout,"[Thread %d] Downloading bytes %lld–%lld\n",
-                t->idx+1, t->start, t->end);
-        fflush(stdout);
-
-        dbg("[DBG] %s\n", cmd);
-        int rc = system(cmd);
-        if(rc!=0){
-            fprintf(stderr,"curl failed for part %d (rc=%d)\n", t->idx, rc);
+static long long get_http_size(const char *url) {
+    char command[2048];
+    long long size = -1;
+    FILE *fp = NULL;
+    snprintf(command, sizeof(command),
+             "curl -sIL --connect-timeout 5 --max-time 20 \"%s\" "
+             "| tr -d '\\r' | "
+             "awk -F': *' 'tolower($1)==\"content-length\"{print $2; exit}'",
+             url);
+    if (DEBUG_LOG) {
+        fprintf(stderr, "[DBG] %s\n", command);
+    }
+    fp = popen(command, "r");
+    if (fp != NULL) {
+        if (fscanf(fp, "%lld", &size) != 1) {
+            size = -1;
         }
-    } else {
-        int infd = open(t->url, O_RDONLY);
-        if(infd<0){ perror("open input"); pthread_exit(NULL); }
-
-        int outfd = open(t->outname, O_CREAT|O_TRUNC|O_WRONLY, 0666);
-        if(outfd<0){ perror("open output"); close(infd); pthread_exit(NULL); }
-
-        const size_t BUFS=1<<16;
-        char *buf=malloc(BUFS);
-        if(!buf){ perror("malloc"); close(infd); close(outfd); pthread_exit(NULL); }
-
-        if(lseek(infd, t->start, SEEK_SET)==(off_t)-1){ perror("lseek"); }
-
-        long long remaining = t->end - t->start + 1;
-        while(remaining>0){
-            size_t chunk = remaining>BUFS?BUFS:(size_t)remaining;
-            ssize_t r = read(infd, buf, chunk);
-            if(r<=0){ break; }
-            ssize_t w = write(outfd, buf, r);
-            if(w != r){ perror("write"); break; }
+        pclose(fp);
+    }
+    if (size > 0) {
+        return size;
+    }
+    snprintf(command, sizeof(command),
+             "curl -sL --connect-timeout 5 --max-time 20 "
+             "-D - -o /dev/null -r 0-0 \"%s\" "
+             "| tr -d '\\r' | "
+             "awk -F'[/ ]' 'tolower($1$2)==\"content-range:bytes\"{print $5; exit}'",
+             url);
+    if (DEBUG_LOG) {
+        fprintf(stderr, "[DBG] %s\n", command);
+    }
+    fp = popen(command, "r");
+    if (fp != NULL) {
+        long long tmp = -1;
+        if (fscanf(fp, "%lld", &tmp) == 1) {
+            size = tmp;
+        }
+        pclose(fp);
+    }
+    if (size > 0) {
+        return size;
+    }
+    snprintf(command, sizeof(command),
+             "curl -sL --connect-timeout 5 --max-time 20 "
+             "-D - -o /dev/null \"%s\" "
+             "| tr -d '\\r' | "
+             "awk -F': *' 'tolower($1)==\"content-length\"{print $2; exit}'",
+             url);
+    if (DEBUG_LOG) {
+        fprintf(stderr, "[DBG] %s\n", command);
+    }
+    fp = popen(command, "r");
+    if (fp != NULL) {
+        long long tmp = -1;
+        if (fscanf(fp, "%lld", &tmp) == 1) {
+            size = tmp;
+        }
+        pclose(fp);
+    }
+    return size;
+}
+static const char *base_name(const char *s) {
+    const char *p = strrchr(s, '/');
+    if (p != NULL) {
+        return p + 1;
+    }
+    return s;
+}
+static void *worker_func(void *arg) {
+    task_t *task = (task_t *)arg;
+    if (task->is_http == 1) {
+        char command[2048];
+        printf("[Thread %d] Downloading bytes %lld-%lld\n",
+               task->index + 1, task->start, task->end);
+        fflush(stdout);
+        snprintf(command, sizeof(command),
+                 "curl -sS --fail -L "
+                 "--connect-timeout 5 --max-time 20 "
+                 "--range %lld-%lld -o \"%s\" \"%s\"",
+                 task->start, task->end,
+                 task->part_name, task->source);
+        if (DEBUG_LOG) {
+            fprintf(stderr, "[DBG] %s\n", command);
+        }
+        (void)system(command);
+    }
+    else {
+        int in_fd = open(task->source, O_RDONLY);
+        if (in_fd < 0) {
+            perror("open source");
+            return NULL;
+        }
+        int out_fd = open(task->part_name, O_CREAT | O_TRUNC | O_WRONLY, 0666);
+        if (out_fd < 0) {
+            perror("open part");
+            close(in_fd);
+            return NULL;
+        }
+        if (lseek(in_fd, task->start, SEEK_SET) == (off_t)-1) {
+            perror("lseek");
+        }
+        long long remaining = task->end - task->start + 1;
+        char buf[1 << 16];
+        while (remaining > 0) {
+            size_t chunk = sizeof(buf);
+            if ((long long)chunk > remaining) {
+                chunk = (size_t)remaining;
+            }
+            ssize_t r = read(in_fd, buf, chunk);
+            if (r <= 0) {
+                break;
+            }
+            ssize_t w = write(out_fd, buf, r);
+            if (w != r) {
+                perror("write");
+                break;
+            }
             remaining -= r;
         }
-
-        free(buf);
-        close(infd);
-        close(outfd);
-
-        fprintf(stdout,"[Thread %d] Copied bytes %lld–%lld\n",
-                t->idx+1, t->start, t->end);
+        close(in_fd);
+        close(out_fd);
+        printf("[Thread %d] Copied bytes %lld-%lld\n",
+               task->index + 1, task->start, task->end);
         fflush(stdout);
     }
-
     return NULL;
 }
-
-static const char* base_name(const char *url){
-    const char *p = strrchr(url,'/');
-    return p? p+1 : url;
-}
-
-static long long http_content_length(const char *url){
-    char cmd[4096];
-    long long size = -1;
-    FILE *p;
-
-    // 1) HEAD (follow redirects) → Content-Length
-    snprintf(cmd,sizeof(cmd),
-        "curl -sIL " CURL_TIMEOUT_OPTS " \"%s\" | tr -d '\\r' | "
-        "awk -F': *' 'tolower($1)==\"content-length\"{print $2; exit}'",
-        url);
-    dbg("[DBG] %s\n", cmd);
-    p = popen(cmd, "r");
-    if(p){
-        if(fscanf(p, "%lld", &size)!=1) size=-1;
-        pclose(p);
-    }
-    if(size>0) return size;
-
-    // 2) Range 0-0 → parse Content-Range: bytes 0-0/NNN
-    snprintf(cmd,sizeof(cmd),
-        "curl -sL " CURL_TIMEOUT_OPTS " -D - -o /dev/null -r 0-0 \"%s\" | tr -d '\\r' | "
-        "awk -F'[/ ]' 'tolower($1$2)==\"content-range:bytes\"{print $5; exit}'",
-        url);
-    dbg("[DBG] %s\n", cmd);
-    p = popen(cmd, "r");
-    if(p){
-        long long tmp=-1;
-        if(fscanf(p, "%lld", &tmp)==1) size=tmp;
-        pclose(p);
-    }
-    if(size>0) return size;
-
-    // 3) GET headers only → Content-Length
-    snprintf(cmd,sizeof(cmd),
-        "curl -sL " CURL_TIMEOUT_OPTS " -D - -o /dev/null \"%s\" | tr -d '\\r' | "
-        "awk -F': *' 'tolower($1)==\"content-length\"{print $2; exit}'",
-        url);
-    dbg("[DBG] %s\n", cmd);
-    p = popen(cmd, "r");
-    if(p){
-        long long tmp=-1;
-        if(fscanf(p, "%lld", &tmp)==1) size=tmp;
-        pclose(p);
-    }
-    return size; // may still be -1 (e.g., chunked transfer)
-}
-
-int main(int argc, char **argv){
-    if(argc!=3){
-        fprintf(stderr,"Usage: %s <url_or_path> <num_threads>\n", argv[0]);
+int main(int argc, char **argv) {
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <url_or_path> <num_threads>\n", argv[0]);
         return 1;
     }
-    const char *url = argv[1];
-    int n = atoi(argv[2]);
-    if(n<=0) n=1;
-    if(n>128) n=128;
-
-    if (getenv("DOWN_DEBUG")) DEBUG_LOG = 1;
-
-    int is_http = (strncmp(url,"http://",7)==0 || strncmp(url,"https://",8)==0);
-
-    long long size = -1;
-    if(is_http){
-        size = http_content_length(url);
-        if(size<=0){
-            fprintf(stderr,"Could not determine content length for %s\n", url);
-            fprintf(stderr,"Tip: Try another test URL or run with DOWN_DEBUG=1 to see curl commands.\n");
-            return 1;
-        }
-    } else {
-        struct stat st;
-        if(stat(url,&st)==0) size = st.st_size;
-        else { perror("stat"); return 1; }
+    const char *source = argv[1];
+    int num_threads = atoi(argv[2]);
+    if (num_threads <= 0) {
+        num_threads = 1;
     }
-
-    const char *base = base_name(url);
+    if (num_threads > 128) {
+        num_threads = 128;
+    }
+    if (getenv("DOWN_DEBUG") != NULL) {
+        DEBUG_LOG = 1;
+    }
+    int is_http = 0;
+    if (strncmp(source, "http://", 7) == 0 ||
+        strncmp(source, "https://", 8) == 0) {
+        is_http = 1;
+    }
+    long long total_size = -1;
+    if (is_http == 1) {
+        total_size = get_http_size(source);
+        if (total_size <= 0) {
+            const char *base = base_name(source);
+            char dest[256];
+            snprintf(dest, sizeof(dest), "%s", (*base) ? base : "download.bin");
+            char command[2048];
+            printf("[Info] Unknown Content-Length -> single-thread download to %s\n",
+                   dest);
+            snprintf(command, sizeof(command),
+                     "curl -sS -L --connect-timeout 5 --max-time 120 "
+                     "-o \"%s\" \"%s\"",
+                     dest, source);
+            if (DEBUG_LOG) {
+                fprintf(stderr, "[DBG] %s\n", command);
+            }
+            int rc = system(command);
+            if (rc != 0) {
+                fprintf(stderr, "curl failed (rc=%d)\n", rc);
+                return 1;
+            }
+            printf("Download complete: %s\n", dest);
+            return 0;
+        }
+    }
+    else {
+        total_size = get_local_size(source);
+    }
+    if (total_size <= 0) {
+        fprintf(stderr, "Could not determine size for %s\n", source);
+        return 1;
+    }
+    const char *base = base_name(source);
     char dest[256];
-    snprintf(dest,sizeof(dest), "%s", *base?base:"download.bin");
-
-    long long part = size / n;
-    long long rem  = size % n;
-
-    pthread_t *ths = calloc(n,sizeof(pthread_t));
-    Task *tasks    = calloc(n,sizeof(Task));
-    if(!ths || !tasks){ fprintf(stderr,"alloc failed\n"); return 1; }
-
-    for(int i=0;i<n;i++){
-        long long s = i*part + (i<rem? i: rem);
-        long long e = s + part - 1 + (i<rem?1:0);
-        if(i==n-1) e = size-1;
-
-        tasks[i].start = s;
-        tasks[i].end   = e;
-        tasks[i].idx   = i;
+    snprintf(dest, sizeof(dest), "%s", (*base) ? base : "download.bin");
+    long long part_size = total_size / num_threads;
+    long long remainder = total_size % num_threads;
+    pthread_t *threads = (pthread_t *)calloc(num_threads, sizeof(pthread_t));
+    task_t    *tasks   = (task_t *)calloc(num_threads, sizeof(task_t));
+    int i;
+    for (i = 0; i < num_threads; i += 1) {
+        long long start = i * part_size + (i < remainder ? i : remainder);
+        long long end   = start + part_size - 1 + (i < remainder ? 1 : 0);
+        if (i == num_threads - 1) {
+            end = total_size - 1;
+        }
+        tasks[i].start   = start;
+        tasks[i].end     = end;
+        tasks[i].index   = i;
         tasks[i].is_http = is_http;
-
-        snprintf(tasks[i].url, sizeof(tasks[i].url), "%s", url);
-        snprintf(tasks[i].outname, sizeof(tasks[i].outname), "part_%d.bin", i);
-
-        if(pthread_create(&ths[i], NULL, worker, &tasks[i])!=0){
+        snprintf(tasks[i].source, sizeof(tasks[i].source), "%s", source);
+        snprintf(tasks[i].part_name, sizeof(tasks[i].part_name),
+                 "part_%d.bin", i);
+        if (pthread_create(&threads[i], NULL, worker_func, &tasks[i]) != 0) {
             perror("pthread_create");
             return 1;
         }
     }
-
-    for(int i=0;i<n;i++){
-        pthread_join(ths[i], NULL);
+    for (i = 0; i < num_threads; i += 1) {
+        (void)pthread_join(threads[i], NULL);
     }
-
     FILE *out = fopen(dest, "wb");
-    if(!out){ perror("fopen dest"); return 1; }
-
-    for(int i=0;i<n;i++){
-        char name[64];
-        snprintf(name,sizeof(name),"part_%d.bin", i);
-        FILE *in = fopen(name, "rb");
-        if(!in){ perror("fopen part"); continue; }
-
-        char buf[1<<16];
-        size_t r;
-        while((r=fread(buf,1,sizeof(buf),in))>0){
-            if(fwrite(buf,1,r,out)!=r){
+    if (out == NULL) {
+        perror("fopen dest");
+        return 1;
+    }
+    for (i = 0; i < num_threads; i += 1) {
+        char part_name[64];
+        snprintf(part_name, sizeof(part_name), "part_%d.bin", i);
+        FILE *in = fopen(part_name, "rb");
+        if (in == NULL) {
+            perror("fopen part");
+            continue;
+        }
+        char buf[1 << 16];
+        size_t r = 0;
+        while ((r = fread(buf, 1, sizeof(buf), in)) > 0) {
+            size_t w = fwrite(buf, 1, r, out);
+            if (w != r) {
                 perror("fwrite");
                 break;
             }
         }
         fclose(in);
-        remove(name);
+        remove(part_name);
     }
     fclose(out);
-
-    printf("Merging parts...\nDownload complete: %s\n", dest);
+    printf("Merging parts...\n");
+    printf("Download complete: %s\n", dest);
     return 0;
 }

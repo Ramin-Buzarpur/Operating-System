@@ -30,7 +30,7 @@ static long long get_http_size(const char *url) {
     long long size = -1;
     FILE *fp = NULL;
     snprintf(command, sizeof(command),
-             "curl -sIL --connect-timeout 5 --max-time 20 \"%s\" "
+             "curl -sIL --connect-timeout 5 --max-time 20 --insecure \"%s\" "
              "| tr -d '\\r' | "
              "awk -F': *' 'tolower($1)==\"content-length\"{print $2; exit}'",
              url);
@@ -48,7 +48,7 @@ static long long get_http_size(const char *url) {
         return size;
     }
     snprintf(command, sizeof(command),
-             "curl -sL --connect-timeout 5 --max-time 20 "
+             "curl -sL --connect-timeout 5 --max-time 20 --insecure "
              "-D - -o /dev/null -r 0-0 \"%s\" "
              "| tr -d '\\r' | "
              "awk -F'[/ ]' 'tolower($1$2)==\"content-range:bytes\"{print $5; exit}'",
@@ -68,7 +68,7 @@ static long long get_http_size(const char *url) {
         return size;
     }
     snprintf(command, sizeof(command),
-             "curl -sL --connect-timeout 5 --max-time 20 "
+             "curl -sL --connect-timeout 5 --max-time 20 --insecure "
              "-D - -o /dev/null \"%s\" "
              "| tr -d '\\r' | "
              "awk -F': *' 'tolower($1)==\"content-length\"{print $2; exit}'",
@@ -101,8 +101,7 @@ static void *worker_func(void *arg) {
                task->index + 1, task->start, task->end);
         fflush(stdout);
         snprintf(command, sizeof(command),
-                 "curl -sS --fail -L "
-                 "--connect-timeout 5 --max-time 20 "
+                 "curl -sS --fail -L --connect-timeout 5 --max-time 20 --insecure "
                  "--range %lld-%lld -o \"%s\" \"%s\"",
                  task->start, task->end,
                  task->part_name, task->source);
@@ -184,7 +183,7 @@ int main(int argc, char **argv) {
             printf("[Info] Unknown Content-Length -> single-thread download to %s\n",
                    dest);
             snprintf(command, sizeof(command),
-                     "curl -sS -L --connect-timeout 5 --max-time 120 "
+                     "curl -sS -L --connect-timeout 5 --max-time 120 --insecure "
                      "-o \"%s\" \"%s\"",
                      dest, source);
             if (DEBUG_LOG) {
